@@ -1,0 +1,27 @@
+﻿# Virtual environment
+.venv/
+venv/
+
+# Raw data (too large for GitHub)
+data/
+
+# Output files (large)
+output/slices/
+output/reports/*.json
+output/reports/*.txt
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment variables
+.env
+*.env
+
+# VS Code
+.vscode/
+
+# Windows
+Thumbs.db
+desktop.ini
