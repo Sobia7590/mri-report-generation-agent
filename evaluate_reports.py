@@ -6,9 +6,9 @@ Changes addressing professor feedback:
   [PROF #1] Reports actual evaluation results with a printed summary table
             and saves evaluation_summary.json with all metrics.
 
-  [PROF #2] Radiologist scoring scaffold:
+  [PROF #2] Author review scoring scaffold:
             - Loads expert_scores.json if it exists (you fill this in with
-              radiologist ratings) and incorporates them into the summary.
+              author's structured review ratings) and incorporates them into the summary.
             - Prints which cases most need expert review.
 
   [PROF #3] Hallucination risk is included in per-case metrics and summary.
@@ -68,6 +68,64 @@ def binary_mask(m: np.ndarray) -> np.ndarray:
 
 def safe_div(a, b):
     return a / b if b != 0 else 0.0
+
+
+# ── [PROF #8] Non-trivial baseline: classical FLAIR-hyperintensity threshold ──
+# Unlike the rule-based "always predicts no tumor" template baseline above,
+# this one actually looks at the same raw images the AI receives (FLAIR only,
+# no ground-truth mask access) and makes a real decision: pixels brighter than
+# mu + z*sigma within the brain are called "hyperintense" (a standard,
+# non-learned anomaly-detection convention). Laterality uses the identical
+# left/right pixel-count split rule as compute_slice_gt, so the comparison to
+# GT is apples-to-apples. This is deliberately simple and not tuned to this
+# dataset beyond the single z parameter (verified stable across z=1.5-3.0).
+
+def read_h5_flair(h5_path: Path) -> np.ndarray:
+    with h5py.File(str(h5_path), "r") as f:
+        img = f["image"][:]
+    return img[:, :, 0].astype(np.float32)  # channel 0 = FLAIR
+
+def threshold_baseline_slice(flair: np.ndarray, z: float = 2.0) -> Dict:
+    brain = flair > 0
+    if int(brain.sum()) < 50:
+        return {"hyper_px": 0, "left_px": 0, "right_px": 0}
+    vals = flair[brain]
+    mu, sigma = float(vals.mean()), float(vals.std())
+    thresh = mu + z * sigma
+    hyper = (flair > thresh) & brain
+    h, w = hyper.shape
+    return {
+        "hyper_px": int(hyper.sum()),
+        "left_px":  int(hyper[:, :w // 2].sum()),
+        "right_px": int(hyper[:, w // 2:].sum()),
+    }
+
+def threshold_baseline_case(volume_id: str, slice_indices: List[int], data_dir: Path,
+                             z: float = 2.0, presence_px_threshold: int = 40) -> Dict:
+    total_px, left_total, right_total = 0, 0, 0
+    for idx in slice_indices:
+        h5_path = data_dir / f"{volume_id}_slice_{idx}.h5"
+        if not h5_path.exists():
+            continue
+        flair = read_h5_flair(h5_path)
+        r = threshold_baseline_slice(flair, z=z)
+        total_px   += r["hyper_px"]
+        left_total  += r["left_px"]
+        right_total += r["right_px"]
+
+    tumor_present = total_px >= presence_px_threshold
+    if not tumor_present:
+        lat = "none"
+    else:
+        ratio = abs(left_total - right_total) / max(total_px, 1)
+        lat = "bilateral" if ratio < 0.35 else ("left" if left_total > right_total else "right")
+
+    return {
+        "tumor_present": tumor_present,
+        "laterality":    lat,
+        "tumor_burden":  classify_burden(total_px) if tumor_present else "none",
+        "tumor_pixels":  total_px,
+    }
 
 def has_any(text: str, kws: List[str]) -> bool:
     return any(k in text for k in kws)
@@ -131,15 +189,25 @@ def aggregate_case_gt(volume_id: str, slice_indices: List[int], data_dir: Path) 
 
 # ── Prediction extraction  ────────────────────────────────────────────────────
 
+import re
+
 def extract_laterality(text: str) -> str:
     t = text.lower()
-    if has_any(t, ["bilateral", "both hemispheres", "both sides"]): return "bilateral"
-    if has_any(t, ["left hemisphere", "left-sided", "left side",
-                   "left frontal", "left parietal", "left temporal",
-                   "left occipital", "left posterior", "left anterior"]): return "left"
-    if has_any(t, ["right hemisphere", "right-sided", "right side",
-                   "right frontal", "right parietal", "right temporal",
-                   "right occipital", "right posterior", "right anterior"]): return "right"
+
+    has_bilateral = bool(re.search(r"\bbilateral\b|\bboth hemispheres\b|\bboth sides\b", t))
+    has_left  = bool(re.search(r"\bleft[\s-](hemispher\w*|sided|side|front\w*|pariet\w*|tempor\w*|occipit\w*|posterior|anterior)", t))
+    has_right = bool(re.search(r"\bright[\s-](hemispher\w*|sided|side|front\w*|pariet\w*|tempor\w*|occipit\w*|posterior|anterior)", t))
+
+    if has_left and has_right and not has_bilateral:
+        return "bilateral"
+    if has_bilateral and not (has_left or has_right):
+        return "bilateral"
+    if has_left and not has_right:
+        return "left"
+    if has_right and not has_left:
+        return "right"
+    if has_bilateral:
+        return "bilateral"
     return "unclear"
 
 def extract_burden(text: str) -> str:
@@ -149,16 +217,36 @@ def extract_burden(text: str) -> str:
     if has_any(t, ["moderate", "well-circumscribed", "surrounding edema"]):   return "medium"
     return "unclear"
 
+def extract_impression(report_text: str) -> str:
+    """The model is explicitly told to state laterality here — search this
+    section first, before falling back to the full text. This avoids
+    incidental 'symmetric'/'bilateral' mentions from the normal-anatomy
+    descriptions in Observe overriding the actual IMPRESSION statement."""
+    m = re.search(
+        r"IMPRESSION:(.*?)(?=RECOMMENDATIONS:|CONFIDENCE:|SEQUENCES REVIEWED:|$)",
+        report_text, re.IGNORECASE | re.DOTALL
+    )
+    return m.group(1) if m else report_text
+
 def extract_prediction(result_json: dict) -> Dict:
+    report = result_json.get("report", "")
+    impression = extract_impression(report).lower()
+
     text = "\n".join([
         result_json.get("observations", ""),
         result_json.get("analysis", ""),
-        result_json.get("report", ""),
+        report,
     ]).lower()
 
     fj = result_json.get("findings_json", {})
     lat = fj.get("laterality", "unclear")
-    refined = extract_laterality(text)
+
+    # Prioritize the IMPRESSION section — the model is explicitly told to
+    # state laterality there — over the full text, which routinely mentions
+    # "bilateral"/"symmetric" while describing NORMAL anatomy in Observe.
+    refined = extract_laterality(impression)
+    if refined == "unclear":
+        refined = extract_laterality(text)
     if refined != "unclear":
         lat = refined
 
@@ -168,11 +256,11 @@ def extract_prediction(result_json: dict) -> Dict:
         "midline_shift":           bool(fj.get("midline_shift", False)),
         "ventricular_abnormality": bool(fj.get("ventricular_abnormality", False)),
         "hyperintense_region":     bool(fj.get("hyperintense_region", False)),
-        "contrast_enhancement":    bool(fj.get("contrast_enhancement", False)),  # [PROF #5]
+        "contrast_enhancement":    bool(fj.get("contrast_enhancement", False)),
         "laterality":              lat,
         "confidence":              fj.get("confidence", "unclear"),
         "predicted_burden":        extract_burden(text),
-        "modalities_reviewed":     fj.get("modalities_reviewed", ["flair"]),     # [PROF #5]
+        "modalities_reviewed":     fj.get("modalities_reviewed", ["flair"]),
     }
 
 
@@ -228,11 +316,80 @@ def laterality_soft(gt: str, pred: str) -> float:
     return 0.0
 
 
-# ── [PROF #2] Radiologist scoring  ───────────────────────────────────────────
+# ── [PROF #7] 95% confidence intervals (nonparametric case-level bootstrap) ──
+# Rationale: resampling whole cases (not individual 0/1 outcomes independently)
+# correctly propagates uncertainty for ratio metrics like precision/recall/F1,
+# which are joint functions of counts, not simple averages of a per-case flag.
+
+def _prf1_from_rows(rows: List[dict]) -> Dict:
+    tp = sum(1 for r in rows if r["gt_tumor_present"] and r["pred_tumor_present"])
+    fp = sum(1 for r in rows if not r["gt_tumor_present"] and r["pred_tumor_present"])
+    fn = sum(1 for r in rows if r["gt_tumor_present"] and not r["pred_tumor_present"])
+    tn = sum(1 for r in rows if not r["gt_tumor_present"] and not r["pred_tumor_present"])
+    precision = safe_div(tp, tp + fp)
+    recall    = safe_div(tp, tp + fn)
+    f1        = safe_div(2 * precision * recall, precision + recall) if (precision + recall) else 0.0
+    accuracy  = safe_div(tp + tn, len(rows)) if rows else 0.0
+    return {"accuracy": accuracy, "precision": precision, "recall": recall, "f1": f1}
+
+def bootstrap_case_ci(case_rows: List[dict], metric_fn, n_boot: int = 2000, seed: int = 42):
+    """Nonparametric 95% CI via resampling cases with replacement.
+    metric_fn(list_of_rows) -> float. Returns (lo, hi) rounded to 4dp, or
+    (nan, nan) if there are no cases."""
+    n = len(case_rows)
+    if n == 0:
+        return (float("nan"), float("nan"))
+    rng = np.random.default_rng(seed)
+    idx = np.arange(n)
+    vals = np.empty(n_boot)
+    for b in range(n_boot):
+        sample_idx = rng.choice(idx, size=n, replace=True)
+        sample = [case_rows[i] for i in sample_idx]
+        vals[b] = metric_fn(sample)
+    lo, hi = np.percentile(vals, [2.5, 97.5])
+    return (round(float(lo), 4), round(float(hi), 4))
+
+def bootstrap_values_ci(values: List[float], n_boot: int = 2000, seed: int = 42):
+    """Nonparametric 95% CI for the mean of a flat list of numeric values
+    (used for the author-review panel, which has no per-case GT/pred rows)."""
+    values = [v for v in values if v is not None]
+    n = len(values)
+    if n == 0:
+        return (float("nan"), float("nan"))
+    arr = np.asarray(values, dtype=float)
+    rng = np.random.default_rng(seed)
+    vals = np.empty(n_boot)
+    for b in range(n_boot):
+        sample = rng.choice(arr, size=n, replace=True)
+        vals[b] = float(np.mean(sample))
+    lo, hi = np.percentile(vals, [2.5, 97.5])
+    return (round(float(lo), 4), round(float(hi), 4))
+
+def compute_metric_cis(case_rows: List[dict], n_boot: int = 2000) -> Dict:
+    """[PROF #7] 95% CIs (case-level bootstrap, n_boot resamples) for the
+    headline AI metrics. CI width shrinks as n_cases grows; with n≈106 these
+    are informative, not decorative."""
+    if not case_rows:
+        return {}
+    return {
+        "accuracy_ci":            bootstrap_case_ci(case_rows, lambda r: _prf1_from_rows(r)["accuracy"], n_boot),
+        "precision_ci":           bootstrap_case_ci(case_rows, lambda r: _prf1_from_rows(r)["precision"], n_boot),
+        "recall_ci":              bootstrap_case_ci(case_rows, lambda r: _prf1_from_rows(r)["recall"], n_boot),
+        "f1_ci":                  bootstrap_case_ci(case_rows, lambda r: _prf1_from_rows(r)["f1"], n_boot),
+        "laterality_accuracy_ci": bootstrap_case_ci(case_rows, lambda r: float(np.mean([x["laterality_match"] for x in r])), n_boot),
+        "laterality_soft_ci":     bootstrap_case_ci(case_rows, lambda r: float(np.mean([x["laterality_soft_score"] for x in r])), n_boot),
+        "quality_score_ci":       bootstrap_case_ci(case_rows, lambda r: float(np.mean([x["quality_score"] for x in r])), n_boot),
+        "pct_flagged_ci":         bootstrap_case_ci(case_rows, lambda r: float(np.mean([x["flagged_for_review"] for x in r])) * 100, n_boot),
+        "n_boot":                 n_boot,
+        "method":                 "nonparametric case-level bootstrap, percentile method, 95% CI",
+    }
+
+
+# ── [PROF #2] Author review scoring  ─────────────────────────────────────────
 
 def load_expert_scores(path: Path) -> Dict:
     """
-    Load radiologist expert scores if file exists.
+    Load author-conducted structured review scores if file exists (NOT clinical radiologist scores).
     Format expected in expert_scores.json:
     [
       {
@@ -255,13 +412,23 @@ def summarize_expert_scores(expert_lookup: Dict) -> Dict:
     if not expert_lookup:
         return {}
     scores = list(expert_lookup.values())
+    acc_vals  = [s.get("accuracy", 0) for s in scores]
+    comp_vals = [s.get("completeness", 0) for s in scores]
+    use_vals  = [s.get("clinical_usefulness", 0) for s in scores]
+    draft_vals = [1.0 if s.get("would_use_as_draft") else 0.0 for s in scores]
     return {
         "n_expert_reviewed":         len(scores),
-        "mean_accuracy":             round(np.mean([s.get("accuracy",0) for s in scores]), 2),
-        "mean_completeness":         round(np.mean([s.get("completeness",0) for s in scores]), 2),
-        "mean_clinical_usefulness":  round(np.mean([s.get("clinical_usefulness",0) for s in scores]), 2),
-        "pct_would_use_as_draft":    round(
-            sum(1 for s in scores if s.get("would_use_as_draft")) / len(scores) * 100, 1
+        "mean_accuracy":             round(np.mean(acc_vals), 2),
+        "mean_accuracy_ci":          bootstrap_values_ci(acc_vals),
+        "mean_completeness":         round(np.mean(comp_vals), 2),
+        "mean_completeness_ci":      bootstrap_values_ci(comp_vals),
+        "mean_clinical_usefulness":  round(np.mean(use_vals), 2),
+        "mean_clinical_usefulness_ci": bootstrap_values_ci(use_vals),
+        "pct_would_use_as_draft":    round(sum(draft_vals) / len(scores) * 100, 1),
+        "pct_would_use_as_draft_ci": tuple(round(x * 100, 1) for x in bootstrap_values_ci(draft_vals)),
+        "ci_note": (
+            f"95% CIs are wide (n={len(scores)} author-reviewed cases, small-sample "
+            "bootstrap) and should be read as indicative, not precise."
         ),
     }
 
@@ -317,6 +484,37 @@ def print_comparison_table(ai_metrics: Dict, baseline_metrics: Dict):
     print("◀ = AI outperforms baseline")
 
 
+def print_threeway_comparison(ai_metrics: Dict, trivial_metrics: Dict, threshold_metrics: Dict):
+    """[PROF #8] AI vs the trivial (always-negative) baseline vs a non-trivial
+    classical FLAIR-hyperintensity threshold baseline that sees the same raw
+    images as the AI (no mask access). The trivial baseline is nearly
+    meaningless for detection (it can only ever score 0); the threshold
+    baseline is the real comparison point for whether the agentic pipeline
+    adds value over simple image statistics."""
+    print("\n" + "=" * 70)
+    print("AI vs TRIVIAL BASELINE vs NON-TRIVIAL THRESHOLD BASELINE  [PROF #8]")
+    print("=" * 70)
+    print(f"{'Metric':<28} {'AI Model':>12} {'Trivial BL':>12} {'Threshold BL':>13}")
+    print("-" * 70)
+    rows = [
+        ("accuracy",              "Tumor detection accuracy"),
+        ("precision",             "Precision"),
+        ("recall",                "Recall"),
+        ("f1",                    "F1 score"),
+        ("laterality_accuracy",   "Laterality exact accuracy"),
+        ("avg_laterality_soft",   "Laterality soft score"),
+    ]
+    for key, label in rows:
+        ai_val  = ai_metrics.get(key, "N/A")
+        triv_val = trivial_metrics.get(key, "N/A")
+        th_val  = threshold_metrics.get(key, "N/A")
+        print(f"{label:<28} {str(ai_val):>12} {str(triv_val):>12} {str(th_val):>13}")
+    print("-" * 70)
+    print("Trivial BL = rule-based 'always no tumor' template (cannot do laterality).")
+    print("Threshold BL = mu+2*sigma FLAIR hyperintensity thresholding, same raw images as AI.")
+    print("=" * 70)
+
+
 # ── Main evaluation  ──────────────────────────────────────────────────────────
 
 def evaluate_all():
@@ -343,6 +541,11 @@ def evaluate_all():
     bl_y_pred  = []
     bl_quality = []
 
+    # Non-trivial (classical FLAIR-threshold) baseline tracking  [PROF #8]
+    th_y_pred      = []
+    th_lat_exact   = 0
+    th_lat_soft    = []
+
     for result_json in results:
         volume_id = result_json["volume_id"]
         slice_indices = [parse_slice_index(x) for x in result_json["slices_used"]]
@@ -360,6 +563,15 @@ def evaluate_all():
         baseline_quality = score_quality(result_json.get("baseline_report", ""))
         bl_y_pred.append(0)   # baseline always predicts no tumor
         bl_quality.append(baseline_quality["quality_score"])
+
+        # Non-trivial baseline: classical FLAIR-hyperintensity thresholding,
+        # same raw images as the AI, no mask access  [PROF #8]
+        th_pred = threshold_baseline_case(volume_id, slice_indices, DATA_DIR)
+        th_y_pred.append(int(th_pred["tumor_present"]))
+        th_lat_match = gt["laterality"] == th_pred["laterality"]
+        if th_lat_match:
+            th_lat_exact += 1
+        th_lat_soft.append(laterality_soft(gt["laterality"], th_pred["laterality"]))
 
         # AI metrics
         ai_y_true.append(int(gt["tumor_present"]))
@@ -411,6 +623,13 @@ def evaluate_all():
             "laterality_match":       lat_match,
             "laterality_soft_score":  lat_soft,
 
+            # Non-trivial threshold baseline  [PROF #8]
+            "th_tumor_present":       th_pred["tumor_present"],
+            "th_laterality":          th_pred["laterality"],
+            "th_tumor_presence_match":gt["tumor_present"] == th_pred["tumor_present"],
+            "th_laterality_match":    th_lat_match,
+            "th_laterality_soft_score": th_lat_soft[-1],
+
             # Expert scores  [PROF #2]
             "expert_accuracy":        expert_row.get("accuracy"),
             "expert_completeness":    expert_row.get("completeness"),
@@ -433,10 +652,22 @@ def evaluate_all():
     ai_metrics["multimodal_cases"]        = sum(
         1 for r in case_rows if r["modality_used"] == "multimodal_4_sequences"
     )                                                                          # [PROF #5]
+    ai_metrics["ci"]                      = compute_metric_cis(case_rows)      # [PROF #7]
 
     # Baseline metrics  [PROF #4]
     bl_metrics = classification_metrics(ai_y_true, bl_y_pred)
     bl_metrics["avg_quality_score"] = round(float(np.mean(bl_quality)), 4)
+
+    # Non-trivial threshold-baseline metrics  [PROF #8]
+    th_metrics = classification_metrics(ai_y_true, th_y_pred)
+    th_metrics["laterality_accuracy"] = round(safe_div(th_lat_exact, len(case_rows)), 4)
+    th_metrics["avg_laterality_soft"] = round(float(np.mean(th_lat_soft)), 4)
+    th_metrics["ci"] = {
+        "accuracy_ci":            bootstrap_case_ci(case_rows, lambda r: float(np.mean([x["th_tumor_presence_match"] for x in r]))),
+        "laterality_accuracy_ci": bootstrap_case_ci(case_rows, lambda r: float(np.mean([x["th_laterality_match"] for x in r]))),
+        "laterality_soft_ci":     bootstrap_case_ci(case_rows, lambda r: float(np.mean([x["th_laterality_soft_score"] for x in r]))),
+        "method": "nonparametric case-level bootstrap, percentile method, 95% CI; z=2.0 FLAIR hyperintensity threshold",
+    }
 
     # ── [PROF #1] Print actual results ──────────────────────────────────────
     print_results_table(case_rows)
@@ -447,25 +678,47 @@ def evaluate_all():
     print(json.dumps({k: v for k, v in ai_metrics.items()
                       if k != "expert_summary"}, indent=2))
 
+    ci = ai_metrics.get("ci", {})
+    if ci:
+        print("\n" + "-" * 55)
+        print(f"95% CONFIDENCE INTERVALS  [PROF #7]  (bootstrap, n_boot={ci.get('n_boot', 2000)})")
+        print("-" * 55)
+        def _fmt_ci(key, label, pct=False):
+            lo, hi = ci.get(key, (float("nan"), float("nan")))
+            if pct:
+                print(f"  {label:<28} [{lo:.1f}%, {hi:.1f}%]")
+            else:
+                print(f"  {label:<28} [{lo:.3f}, {hi:.3f}]")
+        _fmt_ci("accuracy_ci",            "Tumor detection accuracy")
+        _fmt_ci("precision_ci",           "Precision")
+        _fmt_ci("recall_ci",              "Recall")
+        _fmt_ci("f1_ci",                  "F1 score")
+        _fmt_ci("laterality_accuracy_ci", "Laterality exact accuracy")
+        _fmt_ci("laterality_soft_ci",     "Laterality soft score")
+        _fmt_ci("quality_score_ci",       "Avg report quality score")
+        _fmt_ci("pct_flagged_ci",         "% flagged for review", pct=True)
+
     print_comparison_table(ai_metrics, bl_metrics)  # [PROF #4]
+    print_threeway_comparison(ai_metrics, bl_metrics, th_metrics)  # [PROF #8]
 
     if expert_lookup:                               # [PROF #2]
         print("\n" + "=" * 55)
-        print("EXPERT RADIOLOGIST EVALUATION  [PROF #2]")
+        print("AUTHOR-CONDUCTED STRUCTURED REVIEW  [PROF #2]")
         print("=" * 55)
         print(json.dumps(ai_metrics["expert_summary"], indent=2))
     else:
         print("\n[PROF #2] No expert_scores.json found.")
-        print("  → Fill in output/reports/expert_scores.json with radiologist ratings.")
+        print("  → Fill in output/reports/expert_scores.json with author review ratings.")
         print("  → Template: [{volume_id, accuracy(1-5), completeness(1-5),")
         print("               clinical_usefulness(1-5), would_use_as_draft(bool), notes}]")
 
     # ── Save outputs ──────────────────────────────────────────────────────────
     summary = {
-        "ai_metrics":       ai_metrics,
-        "baseline_metrics": bl_metrics,   # [PROF #4]
-        "n_cases":          len(case_rows),
-        "generated_at":     str(Path(__file__).stat().st_mtime),
+        "ai_metrics":                ai_metrics,
+        "baseline_metrics":          bl_metrics,   # [PROF #4]
+        "threshold_baseline_metrics": th_metrics,  # [PROF #8]
+        "n_cases":                   len(case_rows),
+        "generated_at":              str(Path(__file__).stat().st_mtime),
     }
     with open(SUMMARY_PATH, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)

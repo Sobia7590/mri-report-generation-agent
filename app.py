@@ -4,7 +4,7 @@ Gradio Demo App — IMPROVED
 Changes addressing professor feedback:
 
   [PROF #1] Shows actual evaluation numbers (accuracy, F1, quality) in UI
-  [PROF #2] Expert radiologist scoring panel — fill scores in-app
+  [PROF #2] Author-conducted structured review panel — fill scores in-app
   [PROF #3] Hallucination risk badge + flagged warning shown prominently
   [PROF #4] Side-by-side AI report vs Baseline report tab
   [PROF #5] Multimodal gallery (shows all 4 sequences per slice)
@@ -143,28 +143,27 @@ def load_case(volume_id):
     multimodal_gallery = []
     overlay_gallery   = []
 
-    # AFTER
+    import re as _re
     for slice_name in slices_used:
-        import re
-        m = re.search(r"slice[_\-](\d+)", slice_name)
+        m = _re.search(r"slice[_\-](\d+)", slice_name)
         num = m.group(1) if m else slice_name.replace(".png", "")
 
-    # FLAIR gallery — try both naming formats
-    for flair_name in [f"flair_slice_{num}.png", slice_name]:
-        flair_path = flair_dir / flair_name
-        if flair_path.exists():
-            ai_gallery.append((str(flair_path), f"FLAIR slice {num}"))
-            break
+        # FLAIR gallery — try both naming formats
+        for flair_name in [f"flair_slice_{num}.png", slice_name]:
+            flair_path = flair_dir / flair_name
+            if flair_path.exists():
+                ai_gallery.append((str(flair_path), f"FLAIR slice {num}"))
+                break
 
-    # Multimodal gallery
-    multi_path = multi_dir / f"multimodal_slice_{num}.png"
-    if multi_path.exists():
-        multimodal_gallery.append((str(multi_path), f"4-seq slice {num}"))
+        # Multimodal gallery
+        multi_path = multi_dir / f"multimodal_slice_{num}.png"
+        if multi_path.exists():
+            multimodal_gallery.append((str(multi_path), f"4-seq slice {num}"))
 
-    # Overlay gallery
-    overlay_path = overlay_dir / f"overlay_slice_{num}.png"
-    if overlay_path.exists():
-        overlay_gallery.append((str(overlay_path), f"GT overlay slice {num}"))
+        # Overlay gallery
+        overlay_path = overlay_dir / f"overlay_slice_{num}.png"
+        if overlay_path.exists():
+            overlay_gallery.append((str(overlay_path), f"GT overlay slice {num}"))
 
     # ── Evaluation summary text ────────────────────────────────────────────────
     eval_row = EVAL_LOOKUP.get(volume_id, {})
@@ -200,7 +199,7 @@ def load_case(volume_id):
     if expert:                           # [PROF #2]
         lines += [
             "",
-            "── EXPERT RADIOLOGIST SCORE  [PROF #2] ──",
+            "── AUTHOR REVIEW SCORE  [PROF #2] ──",
             f"Accuracy (1-5):    {expert.get('accuracy', 'pending')}",
             f"Completeness:      {expert.get('completeness', 'pending')}",
             f"Usefulness:        {expert.get('clinical_usefulness', 'pending')}",
@@ -236,7 +235,7 @@ def load_case(volume_id):
 # ── [PROF #2] Save expert score ───────────────────────────────────────────────
 
 def save_expert_score(volume_id, accuracy, completeness, usefulness, would_use, notes):
-    """Save radiologist rating from the UI."""
+    """Save author's structured review rating from the UI (not a clinical radiologist review)."""
     if not volume_id:
         return "No volume selected."
     scores = list(EXPERT_LOOKUP.values())
@@ -262,8 +261,8 @@ def save_expert_score(volume_id, accuracy, completeness, usefulness, would_use, 
 
 volume_choices = load_volume_ids()
 
-with gr.Blocks(title="MRI Report Agent Demo") as demo:
-    gr.Markdown("# 🧠 MRI Report Generation Agent — Final Demo")
+with gr.Blocks(title="MRI Report Agent") as demo:
+    gr.Markdown("# 🧠 MRI Report Generation Agent")
     gr.Markdown("*Research prototype — all reports must be verified by a qualified radiologist*")
 
     with gr.Row():
@@ -314,7 +313,7 @@ with gr.Blocks(title="MRI Report Agent Demo") as demo:
 
         # ── Tab 5: Expert Scoring  [PROF #2] ─────────────────────────────────
         with gr.Tab("👩‍⚕️ Expert Scoring  [PROF #2]"):
-            gr.Markdown("### Radiologist / Expert Review Panel")
+            gr.Markdown("### Author Review Panel (structured self-assessment, not a clinical radiologist review)")
             gr.Markdown("Rate the AI-generated report for the selected volume. "
                         "Scores are saved to `expert_scores.json` and included in evaluation.")
             with gr.Row():

@@ -23,6 +23,7 @@ import os
 import re
 import json
 import base64
+import random
 from pathlib import Path
 from datetime import datetime
 
@@ -36,7 +37,8 @@ REPORTS_DIR = Path(r"D:\Downloads\Agent\output\reports")
 MANIFEST    = OUTPUT_DIR / "manifest.json"
 
 MAX_SLICES           = 10       # was 3
-NUM_CASES_TO_PROCESS = 20      # full dataset
+NUM_CASES_TO_PROCESS = 100     # bumped from 20 for a larger, defensible sample
+RANDOM_SEED           = 42     # fixed seed -> reproducible random sample
 SKIP_EXISTING        = True
 MODEL                = "claude-opus-4-5"
 
@@ -253,60 +255,48 @@ GENERATED REPORT:
 Your task: Review the report for hallucinations — claims in the report that are NOT
 supported by the observations above.
 
-For each finding in the FINDINGS and IMPRESSION sections, state:
+IMPORTANT: Begin your response with these two lines FIRST, before any detailed analysis:
+
+HALLUCINATION RISK: Low / Medium / High
+SUMMARY: One sentence summarizing the overall reliability of this report.
+
+Then, AFTER stating the risk and summary above, go through each finding in the FINDINGS
+and IMPRESSION sections and state:
   SUPPORTED   — if the observation explicitly mentions this finding
   INFERRED    — if the observation implies it but does not state it directly
   UNSUPPORTED — if the observation does NOT mention this at all (potential hallucination)
-
-Then provide:
-HALLUCINATION RISK: Low / Medium / High
-SUMMARY: One sentence summarizing the overall reliability of this report.
 
 Be strict. "Inferred" is acceptable; "Unsupported" findings should be flagged."""
 
 
 def step4_verify(client: anthropic.Anthropic, observations: str, report: str) -> dict:
-    """
-    [PROF #3] Step 4: Hallucination verification.
-    Returns dict with verification text + risk level.
-    """
     print("  [Step 4] Verifying report for hallucinations...")
-    prompt = VERIFY_PROMPT_TEMPLATE.format(
-        observations=observations,
-        report=report
-    )
+    prompt = VERIFY_PROMPT_TEMPLATE.format(observations=observations, report=report)
     response = client.messages.create(
         model=MODEL,
-        max_tokens=800,
+        max_tokens=1500,
         messages=[{"role": "user", "content": prompt}]
     )
     text = get_text_from_response(response)
-
-    # Extract risk level
-    risk = "unknown"
     text_lower = text.lower()
-    if any(x in text_lower for x in [
-    "hallucination risk: low", "risk: low", "risk is low",
-    "low hallucination", "overall risk: low"
-]):
+
+    risk = "unknown"
+    if any(x in text_lower for x in ["hallucination risk: low", "risk: low", "risk is low", "low hallucination", "overall risk: low"]):
         risk = "low"
-    elif any(x in text_lower for x in [
-    "hallucination risk: medium", "risk: medium", "risk is medium",
-    "medium hallucination", "overall risk: medium", "moderate risk"
-]):
+    elif any(x in text_lower for x in ["hallucination risk: medium", "risk: medium", "risk is medium", "medium hallucination", "overall risk: medium", "moderate risk"]):
         risk = "medium"
-    elif any(x in text_lower for x in [
-    "hallucination risk: high", "risk: high", "risk is high",
-    "high hallucination", "overall risk: high"
-]):
+    elif any(x in text_lower for x in ["hallucination risk: high", "risk: high", "risk is high", "high hallucination", "overall risk: high"]):
         risk = "high"
-    else:
-        if "low" in text_lower and "risk" in text_lower:
-            risk = "low"
-        elif "medium" in text_lower and "risk" in text_lower:
-            risk = "medium"
-        elif "high" in text_lower and "risk" in text_lower:
-            risk = "high"
+    elif "risk" in text_lower:
+        if "low" in text_lower: risk = "low"
+        elif "medium" in text_lower: risk = "medium"
+        elif "high" in text_lower: risk = "high"
+
+    return {
+        "verification_text": text,
+        "hallucination_risk": risk,
+        "flagged": risk in ("medium", "high"),
+    }
    
 
 
@@ -553,7 +543,10 @@ if __name__ == "__main__":
         manifest = json.load(f)
 
     volume_ids = [m["volume_id"] for m in manifest]
-    to_process = volume_ids[:NUM_CASES_TO_PROCESS]
+    rng = random.Random(RANDOM_SEED)
+    n = min(NUM_CASES_TO_PROCESS, len(volume_ids))
+    to_process = rng.sample(volume_ids, n)
+    to_process.sort(key=lambda v: int(v.split("_")[1]))  # stable, readable order for logs/output
 
     if SKIP_EXISTING:
         to_process = [v for v in to_process
