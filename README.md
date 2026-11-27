@@ -78,7 +78,6 @@ The system achieves high report quality and a hallucination-screening step that 
 - `fix_hallucination_risk.py` — hallucination-risk label post-processing
 - `peek.py` / `peek_volume1.py` — quick data/volume inspection utilities
 - `app.py` — Gradio web UI (localhost:7860) used for the author-conducted review
-- `evaluate_reports_backup_before_baseline.py` / `evaluate_reports_backup_before_ci.py` — earlier snapshots of the evaluation script, kept for reference
 
 ## Setup
 
