@@ -110,8 +110,7 @@ This study uses the public, de-identified BraTS 2020 dataset; no new human-subje
 
 ## AI use disclosure
 
-Generative AI was used in two distinct capacities in this project. First, a general-purpose large language model (Claude Opus 4.5, Anthropic) is the system under study — its use and evaluation are the research contribution itself, not an undisclosed writing aid. Second, an AI coding assistant (Claude, Anthropic, via Claude Code) was used to help implement the evaluation harness and statistical-analysis code; all code, analyses, and content were reviewed and approved by the authors.
-
+Generative AI was used in two distinct capacities in this project. First, a general-purpose large language model (Claude Opus 4.5, Anthropic) is the system under study — its use and evaluation are the research contribution itself, not an undisclosed writing aid. Second, Paperpal (Cactus Communications) was used to assist with language editing of this manuscript during preparation; all code, analyses, and content were reviewed and approved by the authors.
 ## Authors
 
 - Sobia Arshad — Department of Anti-Aging Healthcare, Inje University
