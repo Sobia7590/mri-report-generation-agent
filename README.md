@@ -1,4 +1,4 @@
-﻿# MRI Report Generation Agent
+# MRI Report Generation Agent
 
 AI-powered brain tumour radiology report generation using Claude (Anthropic) and the BraTS 2020 dataset.
 
@@ -6,13 +6,16 @@ AI-powered brain tumour radiology report generation using Claude (Anthropic) and
 An end-to-end agentic AI pipeline that reads brain MRI scans and automatically generates structured radiology reports using a 4-step pipeline: **Observe → Analyze → Report → Verify**.
 
 ## Results
-| Metric | AI Model | Baseline |
-|--------|----------|----------|
-| Accuracy | 0.95 | 0.00 |
-| Precision | 1.00 | 0.00 |
-| Recall | 0.95 | 0.00 |
-| F1 Score | 0.97 | 0.00 |
-| Report Quality | 0.96 | 0.33 |
+Evaluated on 106 BraTS 2020 volumes against an image-blind trivial baseline and a non-trivial FLAIR-threshold baseline, with 95% bootstrap confidence intervals.
+
+| Metric | System | Trivial baseline | Threshold baseline |
+|--------|--------|-------------------|---------------------|
+| Tumor accuracy/precision/recall/F1 | 1.00 [1.00, 1.00] | 0.00 | 1.00 [1.00, 1.00] |
+| Report quality (0-1) | 0.992 [0.980, 1.00] | 0.667 | - |
+| Laterality, exact match | 0.293 [0.208, 0.377] | - | 0.745 [0.660, 0.821] |
+| Laterality, soft match | 0.443 [0.368, 0.524] | - | 0.868 [0.826, 0.910] |
+
+The accuracy/precision/recall/F1 numbers look perfect because every case in this sample has a tumor present (an all-positive set), so a baseline that always guesses "tumor" scores the same on those metrics. The laterality result is the more informative one: the system gets left/right wrong on the majority of unilateral cases, performing worse than the simple threshold baseline. See the paper for the full analysis, including a 9-case author-conducted structured review.
 
 ## Project Structure
 - mri_pipeline.py — Data extraction and preprocessing
